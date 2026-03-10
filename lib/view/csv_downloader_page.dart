@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:js_interop';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -7,9 +6,13 @@ import 'package:http/http.dart' as http;
 import 'package:web/web.dart' as web;
 import 'package:archive/archive.dart';
 
-// ─── Data Models ────────────────────────────────────────────────────────────
+// ─── Constants ───────────────────────────────────────────────────────────────
 
-enum DownloadStatus { idle, pending, downloading, done, error }
+/// Max simultaneous HTTP requests. Too high = browser throttles + OOM.
+const int _kConcurrency = 6;
+
+/// Only call setState at most once per this interval during downloads.
+const Duration _kUiThrottle = Duration(milliseconds: 250);
 
 const _mimeToExt = {
   'application/pdf': '.pdf',
@@ -37,6 +40,10 @@ const _mimeToExt = {
   'audio/wav': '.wav',
 };
 
+// ─── Data Models ────────────────────────────────────────────────────────────
+
+enum DownloadStatus { idle, pending, downloading, done, error }
+
 class CsvRow {
   final String contractorFullName;
   final String documentName;
@@ -44,30 +51,22 @@ class CsvRow {
   DownloadStatus status;
   String? errorMessage;
   int? bytes;
-  Uint8List? fileBytes;
   String? detectedExtension;
 
-  CsvRow({required this.contractorFullName, required this.documentName, required this.url, this.status = DownloadStatus.idle, this.errorMessage, this.bytes, this.fileBytes, this.detectedExtension});
+  CsvRow({required this.contractorFullName, required this.documentName, required this.url, this.status = DownloadStatus.idle, this.errorMessage, this.bytes, this.detectedExtension});
 
-  String get safeContractorName => contractorFullName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();
+  String get safeContractorName => contractorFullName.replaceAll(RegExp(r'[<>:"/\\|?*\n\r\t]'), '_').trim();
 
-  String get safeDocumentName => documentName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();
+  String get safeDocumentName => documentName.replaceAll(RegExp(r'[<>:"/\\|?*\n\r\t]'), '_').trim();
 
-  /// Resolve extension with priority:
-  /// 1. DocumentName already has an extension
-  /// 2. Content-Type from actual HTTP response
-  /// 3. URL path extension
   String get fileExtension {
-    // 1. DocumentName already has a recognisable extension
     final nameParts = documentName.split('.');
     if (nameParts.length > 1 && nameParts.last.length >= 2 && nameParts.last.length <= 5) {
       return '.${nameParts.last}';
     }
-    // 2. Content-Type detected during download
     if (detectedExtension != null && detectedExtension!.isNotEmpty) {
       return detectedExtension!;
     }
-    // 3. URL path
     try {
       final uri = Uri.parse(url);
       final segment = uri.pathSegments.lastWhere((s) => s.contains('.'), orElse: () => '');
@@ -90,11 +89,10 @@ class CsvRow {
 // ─── CSV Parser ─────────────────────────────────────────────────────────────
 
 List<CsvRow> parseCsv(String csvText) {
-  final lines = csvText.split('\n').map((l) => l.trim()).where((l) => l.isNotEmpty).toList();
+  final lines = csvText.split('\n').map((l) => l.trimRight()).where((l) => l.isNotEmpty).toList();
 
   if (lines.isEmpty) return [];
 
-  // Parse header
   final header = _splitCsvLine(lines.first).map((h) => h.trim().toLowerCase()).toList();
 
   final contractorIdx = header.indexWhere((h) => h == 'contractorfullname' || h == 'contractor_full_name' || h == 'contractor');
@@ -108,12 +106,13 @@ List<CsvRow> parseCsv(String csvText) {
   final rows = <CsvRow>[];
   for (int i = 1; i < lines.length; i++) {
     final cols = _splitCsvLine(lines[i]);
-    if (cols.length > contractorIdx && cols.length > documentIdx && cols.length > urlIdx) {
+    final maxIdx = [contractorIdx, documentIdx, urlIdx].reduce((a, b) => a > b ? a : b);
+    if (cols.length > maxIdx) {
       final contractor = cols[contractorIdx].trim();
       final document = cols[documentIdx].trim();
       final url = cols[urlIdx].trim();
       if (contractor.isNotEmpty && url.isNotEmpty) {
-        rows.add(CsvRow(contractorFullName: contractor, documentName: document.isEmpty ? 'Document_${i}' : document, url: url));
+        rows.add(CsvRow(contractorFullName: contractor, documentName: document.isEmpty ? 'Document_$i' : document, url: url));
       }
     }
   }
@@ -145,6 +144,15 @@ List<String> _splitCsvLine(String line) {
   return result;
 }
 
+// ─── Download State ──────────────────────────────────────────────────────────
+
+class _DownloadState {
+  int completed = 0;
+  int totalBytes = 0;
+  int doneCount = 0;
+  int errorCount = 0;
+}
+
 // ─── Main Page ──────────────────────────────────────────────────────────────
 
 class CsvDownloaderPage extends StatefulWidget {
@@ -156,14 +164,20 @@ class CsvDownloaderPage extends StatefulWidget {
 
 class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProviderStateMixin {
   List<CsvRow> _rows = [];
+  List<_ContractorSummary> _contractors = [];
+
   bool _isDownloading = false;
   bool _isDone = false;
   String? _parseError;
   String? _csvFileName;
-  int _completedCount = 0;
-  int _totalDownloadedBytes = 0;
-  DownloadStatus? _activeFilter; // null = show all, done = show done, error = show errors
+
+  final _dl = _DownloadState();
+
+  Timer? _uiTimer;
+  bool _uiDirty = false;
+
   late AnimationController _pulseController;
+  final http.Client _httpClient = http.Client();
 
   @override
   void initState() {
@@ -173,8 +187,27 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
 
   @override
   void dispose() {
+    _uiTimer?.cancel();
     _pulseController.dispose();
+    _httpClient.close();
     super.dispose();
+  }
+
+  // ── Throttled setState ─────────────────────────────────────────────────────
+
+  void _markDirty() {
+    _uiDirty = true;
+    _uiTimer ??= Timer.periodic(_kUiThrottle, (_) {
+      if (_uiDirty && mounted) {
+        setState(() => _uiDirty = false);
+      }
+    });
+  }
+
+  void _stopUiTimer() {
+    _uiTimer?.cancel();
+    _uiTimer = null;
+    if (mounted) setState(() {});
   }
 
   // ── CSV Import ─────────────────────────────────────────────────────────────
@@ -200,34 +233,42 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
         try {
           final rows = parseCsv(text);
           if (rows.isEmpty) throw Exception('No valid rows found in CSV');
+          final contractors = _buildContractorSummaries(rows);
           setState(() {
             _rows = rows;
+            _contractors = contractors;
             _parseError = null;
             _isDone = false;
-            _completedCount = 0;
-            _totalDownloadedBytes = 0;
-            _activeFilter = null;
+            _dl.completed = 0;
+            _dl.totalBytes = 0;
+            _dl.doneCount = 0;
+            _dl.errorCount = 0;
           });
           _showConfirmDialog();
         } catch (e) {
           setState(() {
             _parseError = e.toString().replaceFirst('Exception: ', '');
             _rows = [];
+            _contractors = [];
           });
         }
       }.toJS;
     }.toJS;
   }
 
+  List<_ContractorSummary> _buildContractorSummaries(List<CsvRow> rows) {
+    final map = <String, _ContractorSummary>{};
+    for (int i = 0; i < rows.length; i++) {
+      final name = rows[i].contractorFullName;
+      map.putIfAbsent(name, () => _ContractorSummary(name: name));
+      map[name]!.indices.add(i);
+    }
+    return map.values.toList();
+  }
+
   // ── Confirm Dialog ─────────────────────────────────────────────────────────
 
   void _showConfirmDialog() {
-    // Group by contractor for preview
-    final grouped = <String, List<CsvRow>>{};
-    for (final row in _rows) {
-      grouped.putIfAbsent(row.contractorFullName, () => []).add(row);
-    }
-
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -238,14 +279,13 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
           side: const BorderSide(color: Color(0xFF30363D)),
         ),
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 560, maxHeight: 600),
+          constraints: const BoxConstraints(maxWidth: 520, maxHeight: 560),
           child: Padding(
             padding: const EdgeInsets.all(24),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Title
                 Row(
                   children: [
                     Container(
@@ -262,10 +302,7 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
                             'Ready to Download',
                             style: TextStyle(color: Color(0xFFE6EDF3), fontSize: 16, fontWeight: FontWeight.w600),
                           ),
-                          Text(
-                            '${_rows.length} file${_rows.length != 1 ? "s" : ""} · ${grouped.length} contractor${grouped.length != 1 ? "s" : ""}',
-                            style: const TextStyle(color: Color(0xFF8B949E), fontSize: 12),
-                          ),
+                          Text('${_rows.length} files · ${_contractors.length} contractors', style: const TextStyle(color: Color(0xFF8B949E), fontSize: 12)),
                         ],
                       ),
                     ),
@@ -273,11 +310,9 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
                 ),
                 const SizedBox(height: 16),
                 const Divider(color: Color(0xFF21262D)),
-                const SizedBox(height: 12),
-
-                // Folder structure preview
+                const SizedBox(height: 8),
                 const Text(
-                  'ZIP structure preview:',
+                  'Folder structure preview:',
                   style: TextStyle(color: Color(0xFF8B949E), fontSize: 11, fontWeight: FontWeight.w500),
                 ),
                 const SizedBox(height: 8),
@@ -288,55 +323,34 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
                       borderRadius: BorderRadius.circular(8),
                       border: Border.all(color: const Color(0xFF21262D)),
                     ),
-                    child: ListView(
+                    child: ListView.builder(
                       shrinkWrap: true,
                       padding: const EdgeInsets.all(12),
-                      children: grouped.entries.map((e) {
-                        return Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                const Icon(Icons.folder, size: 14, color: Color(0xFFE3B341)),
-                                const SizedBox(width: 6),
-                                Text(
-                                  e.key,
-                                  style: const TextStyle(color: Color(0xFFE3B341), fontSize: 12, fontWeight: FontWeight.w600, fontFamily: 'monospace'),
-                                ),
-                              ],
-                            ),
-                            ...e.value.map(
-                              (row) => Padding(
-                                padding: const EdgeInsets.only(left: 20, top: 4),
-                                child: Row(
-                                  children: [
-                                    const Text(
-                                      '└ ',
-                                      style: TextStyle(color: Color(0xFF484F58), fontSize: 11, fontFamily: 'monospace'),
-                                    ),
-                                    const Icon(Icons.insert_drive_file_outlined, size: 11, color: Color(0xFF8B949E)),
-                                    const SizedBox(width: 4),
-                                    Expanded(
-                                      child: Text(
-                                        row.safeDocumentName,
-                                        style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11, fontFamily: 'monospace'),
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                  ],
+                      itemCount: _contractors.length,
+                      itemBuilder: (_, i) {
+                        final c = _contractors[i];
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.folder, size: 13, color: Color(0xFFE3B341)),
+                              const SizedBox(width: 6),
+                              Expanded(
+                                child: Text(
+                                  c.name,
+                                  style: const TextStyle(color: Color(0xFFE3B341), fontSize: 12, fontFamily: 'monospace'),
+                                  overflow: TextOverflow.ellipsis,
                                 ),
                               ),
-                            ),
-                            const SizedBox(height: 8),
-                          ],
+                              Text('${c.indices.length} file${c.indices.length != 1 ? "s" : ""}', style: const TextStyle(color: Color(0xFF484F58), fontSize: 11)),
+                            ],
+                          ),
                         );
-                      }).toList(),
+                      },
                     ),
                   ),
                 ),
-                const SizedBox(height: 16),
-
-                // Info note
+                const SizedBox(height: 12),
                 Container(
                   padding: const EdgeInsets.all(10),
                   decoration: BoxDecoration(
@@ -344,13 +358,13 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
                     borderRadius: BorderRadius.circular(8),
                     border: Border.all(color: const Color(0xFF0A84FF).withOpacity(0.2)),
                   ),
-                  child: Row(
+                  child: const Row(
                     children: [
-                      const Icon(Icons.info_outline, size: 14, color: Color(0xFF58A6FF)),
-                      const SizedBox(width: 8),
-                      const Expanded(
+                      Icon(Icons.info_outline, size: 14, color: Color(0xFF58A6FF)),
+                      SizedBox(width: 8),
+                      Expanded(
                         child: Text(
-                          'Files will be downloaded as a ZIP with folders per contractor. Your browser will save it to your Downloads folder.',
+                          'Files download with 6 concurrent connections and are streamed directly into the ZIP — no large memory spikes.',
                           style: TextStyle(color: Color(0xFF58A6FF), fontSize: 11),
                         ),
                       ),
@@ -358,8 +372,6 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
                   ),
                 ),
                 const SizedBox(height: 16),
-
-                // Buttons
                 Row(
                   mainAxisAlignment: MainAxisAlignment.end,
                   children: [
@@ -398,72 +410,87 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
     setState(() {
       _isDownloading = true;
       _isDone = false;
-      _completedCount = 0;
-      _totalDownloadedBytes = 0;
+      _dl.completed = 0;
+      _dl.totalBytes = 0;
+      _dl.doneCount = 0;
+      _dl.errorCount = 0;
       for (final row in _rows) {
         row.status = DownloadStatus.pending;
         row.errorMessage = null;
-        row.fileBytes = null;
+        row.bytes = null;
+        row.detectedExtension = null;
       }
     });
 
-    // Download files one at a time to avoid overwhelming the browser
-    for (int i = 0; i < _rows.length; i++) {
-      final row = _rows[i];
-      setState(() => row.status = DownloadStatus.downloading);
+    final archive = Archive();
+    final semaphore = _Semaphore(_kConcurrency);
 
+    final futures = List.generate(_rows.length, (i) async {
+      await semaphore.acquire();
+      if (!mounted) {
+        semaphore.release();
+        return;
+      }
+
+      final row = _rows[i];
+      row.status = DownloadStatus.downloading;
+      _markDirty();
+
+      Uint8List? fileBytes;
       try {
         final uri = Uri.parse(row.url);
-        final response = await http.get(uri).timeout(const Duration(seconds: 60));
+        final response = await _httpClient.get(uri).timeout(const Duration(seconds: 60));
 
         if (response.statusCode >= 200 && response.statusCode < 300) {
-          // Detect extension from Content-Type header
-          final contentType = response.headers['content-type']?.split(';').first.trim().toLowerCase();
-          if (contentType != null && _mimeToExt.containsKey(contentType)) {
-            row.detectedExtension = _mimeToExt[contentType];
+          fileBytes = response.bodyBytes;
+          row.bytes = fileBytes.length;
+
+          final ct = response.headers['content-type']?.split(';').first.trim().toLowerCase();
+          if (ct != null && _mimeToExt.containsKey(ct)) {
+            row.detectedExtension = _mimeToExt[ct];
           }
-          row.fileBytes = response.bodyBytes;
-          row.bytes = response.bodyBytes.length;
+
           row.status = DownloadStatus.done;
+          _dl.doneCount++;
+          _dl.totalBytes += fileBytes.length;
+
+          // Add to archive immediately then allow GC to reclaim
+          archive.addFile(ArchiveFile(row.zipPath, fileBytes.length, fileBytes));
+          fileBytes = null;
         } else {
           row.status = DownloadStatus.error;
           row.errorMessage = 'HTTP ${response.statusCode}';
+          _dl.errorCount++;
         }
       } on TimeoutException {
         row.status = DownloadStatus.error;
         row.errorMessage = 'Timed out';
+        _dl.errorCount++;
       } catch (e) {
         row.status = DownloadStatus.error;
         row.errorMessage = e.toString().replaceFirst('Exception: ', '');
+        _dl.errorCount++;
+      } finally {
+        _dl.completed++;
+        semaphore.release();
+        _markDirty();
       }
+    });
 
-      setState(() {
-        _completedCount = i + 1;
-        _totalDownloadedBytes = _rows.where((r) => r.bytes != null).fold(0, (sum, r) => sum + r.bytes!);
-      });
+    await Future.wait(futures);
+
+    if (archive.isNotEmpty) {
+      _triggerZipDownload(archive);
     }
 
-    // Build ZIP
-    final successRows = _rows.where((r) => r.fileBytes != null).toList();
-    if (successRows.isNotEmpty) {
-      _buildAndTriggerZip(successRows);
-    }
-
+    _stopUiTimer();
     setState(() {
       _isDownloading = false;
       _isDone = true;
     });
   }
 
-  void _buildAndTriggerZip(List<CsvRow> rows) {
-    final archive = Archive();
-
-    for (final row in rows) {
-      final bytes = row.fileBytes!;
-      final file = ArchiveFile(row.zipPath, bytes.length, bytes);
-      archive.addFile(file);
-    }
-
+  void _triggerZipDownload(Archive archive) {
     final zipList = ZipEncoder().encode(archive);
     if (zipList == null) return;
     final zipBytes = Uint8List.fromList(zipList);
@@ -477,7 +504,7 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
     web.URL.revokeObjectURL(url);
   }
 
-  // ── Build ──────────────────────────────────────────────────────────────────
+  // ── Helpers ────────────────────────────────────────────────────────────────
 
   String _formatBytes(int bytes) {
     if (bytes < 1024) return '$bytes B';
@@ -488,16 +515,9 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
     return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
-  Map<String, List<CsvRow>> get _groupedRows {
-    final grouped = <String, List<CsvRow>>{};
-    final source = _activeFilter == null ? _rows : _rows.where((r) => r.status == _activeFilter).toList();
-    for (final row in source) {
-      grouped.putIfAbsent(row.contractorFullName, () => []).add(row);
-    }
-    return grouped;
-  }
+  double get _progress => _rows.isEmpty ? 0 : _dl.completed / _rows.length;
 
-  double get _progress => _rows.isEmpty ? 0 : _completedCount / _rows.length;
+  // ── Build ──────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -559,11 +579,11 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Container(
-              padding: const EdgeInsets.all(20),
+              padding: const EdgeInsets.all(24),
               decoration: BoxDecoration(
                 color: const Color(0xFF161B22),
                 borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: const Color(0xFF30363D), style: BorderStyle.solid),
+                border: Border.all(color: const Color(0xFF30363D)),
               ),
               child: Column(
                 children: [
@@ -573,7 +593,7 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
                     'Import a CSV file',
                     style: TextStyle(color: Color(0xFF8B949E), fontSize: 16, fontWeight: FontWeight.w500),
                   ),
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 6),
                   const Text('Required columns: ContractorFullName, DocumentName, Url', style: TextStyle(color: Color(0xFF484F58), fontSize: 12)),
                   const SizedBox(height: 20),
                   FilledButton.icon(
@@ -616,25 +636,21 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
   }
 
   Widget _buildContent() {
-    final grouped = _groupedRows;
-    final doneCount = _rows.where((r) => r.status == DownloadStatus.done).length;
-    final errorCount = _rows.where((r) => r.status == DownloadStatus.error).length;
-
     return Expanded(
       child: Column(
         children: [
-          // Progress / action bar
+          // Summary bar
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
             color: const Color(0xFF161B22),
             child: Row(
               children: [
-                _chip(Icons.people_outline, '${grouped.length} contractors', const Color(0xFF8B949E), null),
+                _chip(Icons.people_outline, '${_contractors.length} contractors', const Color(0xFF8B949E)),
                 const SizedBox(width: 8),
-                _chip(Icons.insert_drive_file_outlined, '${_rows.length} files', const Color(0xFF8B949E), null),
-                if (doneCount > 0) ...[const SizedBox(width: 8), _chip(Icons.check_circle_outline, '$doneCount done', const Color(0xFF3FB950), DownloadStatus.done)],
-                if (errorCount > 0) ...[const SizedBox(width: 8), _chip(Icons.error_outline, '$errorCount errors', const Color(0xFFF85149), DownloadStatus.error)],
-                if (_totalDownloadedBytes > 0) ...[const SizedBox(width: 8), _chip(Icons.storage_outlined, _formatBytes(_totalDownloadedBytes), const Color(0xFF0A84FF), null)],
+                _chip(Icons.insert_drive_file_outlined, '${_rows.length} files', const Color(0xFF8B949E)),
+                if (_dl.doneCount > 0) ...[const SizedBox(width: 8), _chip(Icons.check_circle_outline, '${_dl.doneCount} done', const Color(0xFF3FB950))],
+                if (_dl.errorCount > 0) ...[const SizedBox(width: 8), _chip(Icons.error_outline, '${_dl.errorCount} errors', const Color(0xFFF85149))],
+                if (_dl.totalBytes > 0) ...[const SizedBox(width: 8), _chip(Icons.storage_outlined, _formatBytes(_dl.totalBytes), const Color(0xFF0A84FF))],
                 const Spacer(),
                 if (!_isDownloading && !_isDone)
                   FilledButton.icon(
@@ -666,7 +682,7 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
           // Progress bar
           if (_isDownloading)
             Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -674,12 +690,12 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       Text(
-                        'Downloading $_completedCount of ${_rows.length}...'
-                        '${_totalDownloadedBytes > 0 ? '  ·  ${_formatBytes(_totalDownloadedBytes)} so far' : ''}',
+                        'Downloading ${_dl.completed} of ${_rows.length}'
+                        '${_dl.totalBytes > 0 ? "  ·  ${_formatBytes(_dl.totalBytes)} so far" : ""}',
                         style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11),
                       ),
                       Text(
-                        '${(_progress * 100).toStringAsFixed(0)}%',
+                        '${(_progress * 100).toStringAsFixed(1)}%',
                         style: const TextStyle(color: Color(0xFF0A84FF), fontSize: 11, fontWeight: FontWeight.w600),
                       ),
                     ],
@@ -701,13 +717,14 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
 
           const Divider(height: 1, color: Color(0xFF21262D)),
 
-          // Grouped list
+          // Virtualized contractor list — only visible items are rendered
           Expanded(
-            child: ListView(
+            child: ListView.builder(
               padding: const EdgeInsets.all(12),
-              children: grouped.entries.map((entry) {
-                return _ContractorGroup(contractorName: entry.key, rows: entry.value, formatBytes: _formatBytes, pulseController: _pulseController);
-              }).toList(),
+              itemCount: _contractors.length,
+              itemBuilder: (ctx, i) => RepaintBoundary(
+                child: _ContractorGroupTile(key: ValueKey(_contractors[i].name), summary: _contractors[i], allRows: _rows, formatBytes: _formatBytes, pulseController: _pulseController),
+              ),
             ),
           ),
         ],
@@ -715,64 +732,64 @@ class _CsvDownloaderPageState extends State<CsvDownloaderPage> with TickerProvid
     );
   }
 
-  Widget _chip(IconData icon, String label, Color color, DownloadStatus? filter) {
-    final isActive = _activeFilter == filter && filter != null;
-    return GestureDetector(
-      onTap: filter == null
-          ? null
-          : () => setState(() {
-              _activeFilter = isActive ? null : filter;
-            }),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: isActive ? color.withOpacity(0.25) : color.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(6),
-          border: Border.all(color: isActive ? color.withOpacity(0.8) : color.withOpacity(0.3), width: isActive ? 1.5 : 1),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 12, color: color),
-            const SizedBox(width: 4),
-            Text(
-              label,
-              style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w500),
-            ),
-            if (filter != null) ...[const SizedBox(width: 4), Icon(isActive ? Icons.close : Icons.filter_list, size: 11, color: color.withOpacity(0.7))],
-          ],
-        ),
+  Widget _chip(IconData icon, String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 12, color: color),
+          const SizedBox(width: 4),
+          Text(
+            label,
+            style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w500),
+          ),
+        ],
       ),
     );
   }
 }
 
-// ─── Contractor Group Card ───────────────────────────────────────────────────
+// ─── Contractor Summary ───────────────────────────────────────────────────────
 
-class _ContractorGroup extends StatefulWidget {
-  final String contractorName;
-  final List<CsvRow> rows;
+class _ContractorSummary {
+  final String name;
+  final List<int> indices = [];
+  _ContractorSummary({required this.name});
+}
+
+// ─── Contractor Group Tile ───────────────────────────────────────────────────
+
+class _ContractorGroupTile extends StatefulWidget {
+  final _ContractorSummary summary;
+  final List<CsvRow> allRows;
   final String Function(int) formatBytes;
   final AnimationController pulseController;
 
-  const _ContractorGroup({required this.contractorName, required this.rows, required this.formatBytes, required this.pulseController});
+  const _ContractorGroupTile({super.key, required this.summary, required this.allRows, required this.formatBytes, required this.pulseController});
 
   @override
-  State<_ContractorGroup> createState() => _ContractorGroupState();
+  State<_ContractorGroupTile> createState() => _ContractorGroupTileState();
 }
 
-class _ContractorGroupState extends State<_ContractorGroup> {
+class _ContractorGroupTileState extends State<_ContractorGroupTile> {
   bool _expanded = false;
 
   @override
   Widget build(BuildContext context) {
-    final doneCount = widget.rows.where((r) => r.status == DownloadStatus.done).length;
-    final errorCount = widget.rows.where((r) => r.status == DownloadStatus.error).length;
-    final isAllDone = doneCount == widget.rows.length;
+    final rows = widget.summary.indices.map((i) => widget.allRows[i]).toList();
+    final doneCount = rows.where((r) => r.status == DownloadStatus.done).length;
+    final errorCount = rows.where((r) => r.status == DownloadStatus.error).length;
+    final isAllDone = doneCount == rows.length && rows.isNotEmpty;
     final hasErrors = errorCount > 0;
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 10),
+      margin: const EdgeInsets.only(bottom: 8),
       decoration: BoxDecoration(
         color: const Color(0xFF161B22),
         borderRadius: BorderRadius.circular(10),
@@ -786,7 +803,6 @@ class _ContractorGroupState extends State<_ContractorGroup> {
       ),
       child: Column(
         children: [
-          // Header
           InkWell(
             onTap: () => setState(() => _expanded = !_expanded),
             borderRadius: BorderRadius.circular(10),
@@ -794,38 +810,46 @@ class _ContractorGroupState extends State<_ContractorGroup> {
               padding: const EdgeInsets.all(14),
               child: Row(
                 children: [
-                  const Icon(Icons.folder, size: 18, color: Color(0xFFE3B341)),
+                  const Icon(Icons.folder, size: 17, color: Color(0xFFE3B341)),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      widget.contractorName,
-                      style: const TextStyle(color: Color(0xFFE6EDF3), fontSize: 14, fontWeight: FontWeight.w600),
+                      widget.summary.name,
+                      style: const TextStyle(color: Color(0xFFE6EDF3), fontSize: 13, fontWeight: FontWeight.w600),
                     ),
                   ),
-                  // File count badge
+                  if (doneCount > 0 || errorCount > 0)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: Text(
+                        '$doneCount/${rows.length}',
+                        style: TextStyle(color: isAllDone ? const Color(0xFF3FB950) : const Color(0xFF8B949E), fontSize: 11, fontFamily: 'monospace'),
+                      ),
+                    ),
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
                     decoration: BoxDecoration(color: const Color(0xFF21262D), borderRadius: BorderRadius.circular(10)),
-                    child: Text('${widget.rows.length} file${widget.rows.length != 1 ? "s" : ""}', style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
+                    child: Text('${rows.length}', style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11)),
                   ),
-                  if (isAllDone && !hasErrors) ...[
-                    const SizedBox(width: 8),
-                    const Icon(Icons.check_circle, size: 16, color: Color(0xFF3FB950)),
-                  ] else if (hasErrors) ...[
-                    const SizedBox(width: 8),
-                    Icon(Icons.warning_amber_outlined, size: 16, color: const Color(0xFFF85149).withOpacity(0.8)),
-                  ],
                   const SizedBox(width: 8),
-                  Icon(_expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down, size: 18, color: const Color(0xFF484F58)),
+                  if (isAllDone && !hasErrors)
+                    const Icon(Icons.check_circle, size: 15, color: Color(0xFF3FB950))
+                  else if (hasErrors)
+                    Icon(Icons.warning_amber_outlined, size: 15, color: const Color(0xFFF85149).withOpacity(0.8)),
+                  const SizedBox(width: 6),
+                  Icon(_expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down, size: 16, color: const Color(0xFF484F58)),
                 ],
               ),
             ),
           ),
-
-          // File rows
           if (_expanded) ...[
             const Divider(height: 1, color: Color(0xFF21262D)),
-            ...widget.rows.map((row) => _FileRow(row: row, formatBytes: widget.formatBytes, pulseController: widget.pulseController)),
+            ListView.builder(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: rows.length,
+              itemBuilder: (_, j) => _FileRow(row: rows[j], formatBytes: widget.formatBytes, pulseController: widget.pulseController),
+            ),
           ],
         ],
       ),
@@ -845,9 +869,8 @@ class _FileRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
           _statusIcon,
           const SizedBox(width: 10),
@@ -857,40 +880,35 @@ class _FileRow extends StatelessWidget {
               children: [
                 Text(
                   row.documentName,
-                  style: const TextStyle(color: Color(0xFFE6EDF3), fontSize: 13, fontWeight: FontWeight.w500),
+                  style: const TextStyle(color: Color(0xFFE6EDF3), fontSize: 12, fontWeight: FontWeight.w500),
                 ),
-                const SizedBox(height: 2),
-                Text(
-                  row.url,
-                  style: const TextStyle(color: Color(0xFF484F58), fontSize: 10, fontFamily: 'monospace'),
-                  overflow: TextOverflow.ellipsis,
-                  maxLines: 1,
-                ),
-                if (row.status == DownloadStatus.downloading) ...[
-                  const SizedBox(height: 6),
-                  AnimatedBuilder(
-                    animation: pulseController,
-                    builder: (_, __) => LinearProgressIndicator(
-                      backgroundColor: const Color(0xFF21262D),
-                      valueColor: AlwaysStoppedAnimation(Color.lerp(const Color(0xFF0A84FF), const Color(0xFF58A6FF), pulseController.value)!),
-                      borderRadius: BorderRadius.circular(2),
-                      minHeight: 2,
+                if (row.status == DownloadStatus.error && row.errorMessage != null)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(row.errorMessage!, style: const TextStyle(color: Color(0xFFF85149), fontSize: 10)),
+                  ),
+                if (row.status == DownloadStatus.downloading)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: AnimatedBuilder(
+                      animation: pulseController,
+                      builder: (_, __) => LinearProgressIndicator(
+                        backgroundColor: const Color(0xFF21262D),
+                        valueColor: AlwaysStoppedAnimation(Color.lerp(const Color(0xFF0A84FF), const Color(0xFF58A6FF), pulseController.value)!),
+                        borderRadius: BorderRadius.circular(2),
+                        minHeight: 2,
+                      ),
                     ),
                   ),
-                ],
-                if (row.status == DownloadStatus.error && row.errorMessage != null) ...[
-                  const SizedBox(height: 4),
-                  Text(row.errorMessage!, style: const TextStyle(color: Color(0xFFF85149), fontSize: 11)),
-                ],
               ],
             ),
           ),
           if (row.bytes != null)
             Padding(
-              padding: const EdgeInsets.only(left: 10),
+              padding: const EdgeInsets.only(left: 8),
               child: Text(
                 formatBytes(row.bytes!),
-                style: const TextStyle(color: Color(0xFF8B949E), fontSize: 11, fontFamily: 'monospace'),
+                style: const TextStyle(color: Color(0xFF484F58), fontSize: 10, fontFamily: 'monospace'),
               ),
             ),
         ],
@@ -901,15 +919,44 @@ class _FileRow extends StatelessWidget {
   Widget get _statusIcon {
     switch (row.status) {
       case DownloadStatus.done:
-        return const Icon(Icons.check_circle, size: 16, color: Color(0xFF3FB950));
+        return const Icon(Icons.check_circle, size: 14, color: Color(0xFF3FB950));
       case DownloadStatus.error:
-        return const Icon(Icons.cancel_outlined, size: 16, color: Color(0xFFF85149));
+        return const Icon(Icons.cancel_outlined, size: 14, color: Color(0xFFF85149));
       case DownloadStatus.downloading:
-        return SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: const Color(0xFF0A84FF)));
+        return const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF0A84FF)));
       case DownloadStatus.pending:
-        return const Icon(Icons.schedule, size: 16, color: Color(0xFF484F58));
+        return const Icon(Icons.schedule, size: 14, color: Color(0xFF484F58));
       case DownloadStatus.idle:
-        return const Icon(Icons.circle_outlined, size: 16, color: Color(0xFF30363D));
+        return const Icon(Icons.circle_outlined, size: 14, color: Color(0xFF30363D));
+    }
+  }
+}
+
+// ─── Semaphore ────────────────────────────────────────────────────────────────
+
+class _Semaphore {
+  final int maxCount;
+  int _count = 0;
+  final _queue = <Completer<void>>[];
+
+  _Semaphore(this.maxCount);
+
+  Future<void> acquire() async {
+    if (_count < maxCount) {
+      _count++;
+      return;
+    }
+    final completer = Completer<void>();
+    _queue.add(completer);
+    await completer.future;
+    _count++;
+  }
+
+  void release() {
+    _count--;
+    if (_queue.isNotEmpty) {
+      final next = _queue.removeAt(0);
+      next.complete();
     }
   }
 }
